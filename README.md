@@ -38,11 +38,21 @@ Rivo is built on **CLEAR** - a pragmatic approach to modern software development
 
 ```typescript
 // user_service.sx - Server only
-export get_user(id: int): result: user, error = 
-  Database.query("SELECT * FROM users WHERE id = ?", [id])
+expose get_user(id: int): result: user, error {
+  user = Database.query("SELECT * FROM users WHERE id = ?", [id]).first()
+  
+  if user == null {
+    return err("User not found")
+  }
+  
+  return user
+}
 
 // profile.cx - Client only
-import { get_user } from "./user_service.sx"  // Compile error
+import { get_user } from "./user_service.sx"
+
+// Compiler generates HTTP client call
+data, err = await get_user(123)
 ```
 
 ---
@@ -131,19 +141,102 @@ type user {
   id: int,
   name: str,
   email?: str,
+  status: user_status,
   created_at: datetime
 }
 
-enum status {
-  pending,
-  active,
-  suspended
+type address {
+  street: str,
+  city: str,
+  country: str
+}
+```
+
+### Enums (Backed)
+
+**Enums with explicit backing values for database storage and serialization:**
+
+```typescript
+// String-backed enums
+enum user_status {
+  pending: "pending",
+  active: "active",
+  suspended: "suspended",
+  deleted: "deleted"
+}
+
+// Int-backed enums
+enum priority {
+  low: 1,
+  medium: 2,
+  high: 3,
+  critical: 4
+}
+
+// Usage
+user = {
+  name: "John",
+  status: user_status.active    // Stores "active"
+}
+
+task = {
+  title: "Fix bug",
+  priority: priority.high       // Stores 3
+}
+
+// Access backing value
+status_value = user_status.active.value    // "active"
+priority_num = priority.high.value         // 3
+
+// Compare
+if user.status == user_status.active {
+  print("User is active")
+}
+
+// Database storage - uses backing value
+Database.insert("users", {
+  name: "John",
+  status: user_status.pending   // Stores "pending" in DB
+})
+
+// From backing value
+status = user_status.from("active")        // user_status.active
+priority = priority.from(3)                // priority.high
+
+// JSON serialization - uses backing value
+json.encode(user)   // { "name": "John", "status": "active" }
+```
+
+### Enum Methods
+
+```typescript
+enum role {
+  admin: "admin",
+  moderator: "moderator",
+  user: "user",
+  guest: "guest"
+}
+
+// Get all values
+role.values()              // [role.admin, role.moderator, role.user, role.guest]
+
+// Get all backing values
+role.backing_values()      // ["admin", "moderator", "user", "guest"]
+
+// From backing value (returns option)
+parsed = role.from("admin")         // Some(role.admin)
+parsed = role.from("invalid")       // None
+
+// Or with result
+parsed, err = role.from_result("admin")
+if err {
+  return err("Invalid role")
 }
 ```
 
 ---
 
-## Type Checking and Conversion
+## Type Checking and Casting
 
 ### Type Checking Methods
 ```typescript
@@ -158,45 +251,65 @@ value.is_map()              // true if map
 value.is_set()              // true if set
 ```
 
-### Type Conversion Methods
+### Type Casting Functions
 ```typescript
-// Convert between types
-value.to_str()              // Convert to string
-value.to_int()              // Convert to int (can fail)
-value.to_float()            // Convert to float (can fail)
-value.to_bool()             // Convert to boolean
-value.to_list()             // Convert to list
-value.to_set()              // Convert to set
+// Built-in casting functions
+int(value)                  // Cast to int
+float(value)                // Cast to float
+str(value)                  // Cast to string
+bool(value)                 // Cast to boolean
 
 // Examples
-42.to_str()                 // "42"
-"42".to_int()               // 42
-3.14.to_int()               // 3 (truncates)
-true.to_int()               // 1
-[1, 2, 2].to_set()          // set([1, 2])
+age = int("42")             // 42
+price = float("19.99")      // 19.99
+text = str(123)             // "123"
+flag = bool("true")         // true
+
+// Casting returns result types - errors propagate automatically
+expose process_age(input: str): result: int, error {
+  age = int(input)          // Errors propagate
+  
+  if age < 0 {
+    return err("Age must be positive")
+  }
+  
+  return age
+}
+
+// Explicit error handling when needed
+age, err = int("abc")
+if err {
+  return err("Invalid age format")
+}
 ```
 
-### Comparison with Conversion
+### Collection Conversions
+```typescript
+// List/Set conversions
+numbers = [1, 2, 2, 3]
+unique = set(numbers)       // set([1, 2, 3])
+back = list(unique)         // [1, 2, 3] (order undefined)
+```
+
+### Comparison with Casting
 ```typescript
 // Strict equality requires same type
 3 == "3"                    // false (different types)
-3 == "3".to_int()           // true
-3.to_str() == "3"           // true
+3 == int("3")               // true
+str(3) == "3"               // true
 ```
 
 ### Working with JSON and Unknown Types
 ```typescript
 // Parse API response (returns unknown type)
-async fetch_user(id: int): result: user, error {
+expose fetch_user(id: int): result: user, error {
   response = await http.get("/users/{id}")
   data = json.parse(response.body)
   
-  // Type check before using
   if !data.is_map() {
     return err("Invalid response format")
   }
   
-  // Check and extract fields
   if !data.has("id") || !data.get("id").is_int() {
     return err("Missing or invalid id")
   }
@@ -205,33 +318,23 @@ async fetch_user(id: int): result: user, error {
     return err("Missing or invalid name")
   }
   
-  // Email is optional - check if present
-  email = null
-  if data.has("email") {
-    email_value = data.get("email")
-    if !email_value.is_null() && !email_value.is_str() {
-      return err("Invalid email type")
-    }
-    email = email_value.is_str() ? email_value : null
-  }
-  
-  // Age might come as string or int - handle both
+  // Handle flexible types - cast as needed
   age_value = data.get("age")
-  age = match {
-    age_value.is_int() = age_value,
-    age_value.is_str() = age_value.to_int()?,
-    _ = return err("Invalid age type")
-  }
+  age = age_value.is_int() ? age_value : int(age_value)
+  
+  // Parse enum from backing value
+  status_str = str(data.get("status"))
+  status = user_status.from(status_str) ?: user_status.pending
   
   return {
     id: data.get("id"),
     name: data.get("name"),
-    email: email,
-    age: age
+    age: age,
+    status: status
   }
 }
 
-// Filter mixed types
+// Filter by type
 mixed = [1, "hello", 3.14, true, null]
 numbers = mixed.filter((v) = v.is_int())     // [1]
 strings = mixed.filter((v) = v.is_str())     // ["hello"]
@@ -325,7 +428,7 @@ numbers.clear()             // Remove all
 numbers.has(2)              // true (contains check)
 
 // Numeric operations
-numbers.sum()               // 7 (1+2+3+1+2)
+numbers.sum()               // 9
 prices = [19.99, 29.99]
 prices.sum()                // 49.98
 
@@ -412,7 +515,7 @@ tags.add("rust")            // No-op, already exists
 tags.delete("rust")         // Remove value
 
 // Conversion
-tags.to_list()              // Convert to list
+list(tags)                  // Convert to list
 
 // Set operations
 a = set([1, 2, 3])
@@ -476,12 +579,7 @@ scores = { "alice": 100 }
 result = scores.get("alice")
 // result is option: int
 
-match scores.get("alice") {
-  Some(score) = print("Score: {score}"),
-  None = print("Not found")
-}
-
-// Or use default operators
+// Use default operators
 score = scores.get("alice") ?: 0
 score = scores.get("alice") ?? 0
 ```
@@ -584,7 +682,6 @@ slice = items[0..<5]  // First 5 items
 ?.          // Optional chaining
 ??          // Null coalescing (ONLY null/undefined)
 ?:          // Elvis operator (ANY falsy value)
-?           // Error propagation (results)
 
 // Nullable marker
 email?: str
@@ -628,9 +725,6 @@ b = value ?: 100   // b = 100 (because 0 is falsy)
 value = ""
 a = value ?? "default"  // a = "" (not null)
 b = value ?: "default"  // b = "default" (falsy)
-
-// Error propagation
-user = get_user(id)?
 ```
 
 ### String
@@ -720,53 +814,6 @@ status = active ? "online" : "offline"
 14. =                               // Assignment, lambda definition
 ```
 
-### Operator Examples
-```typescript
-// Arithmetic with precedence
-result = 2 + 3 * 4        // 14 (not 20)
-result = (2 + 3) * 4      // 20
-
-// Strict equality
-5 == 5          // true
-5 == "5"        // false (different types)
-0 == false      // false (different types)
-true == 1       // false (different types)
-
-// Logical short-circuit
-user.active && process(user)
-
-// Null coalescing vs Elvis - IMPORTANT DIFFERENCE
-name = user?.name ?? "Guest"      // Only if null/undefined
-port = config.port ?: 8080        // If any falsy (null, 0, false, "")
-
-// Elvis replaces ALL falsy values
-display = user.online ?: "Offline"  // false becomes "Offline"
-retries = attempts ?: 3             // 0 becomes 3
-
-// Null coalescing keeps non-null values
-count = getValue() ?? 0   // Only replaces null/undefined
-online = user.active ?? true  // false stays false, only null becomes true
-
-// Optional chaining
-city = user?.address?.city ?: "Unknown"
-
-// Spaceship for sorting
-users.sort((a, b) = a.name <=> b.name)
-items.sort((a, b) = b.priority <=> a.priority)
-
-// Error propagation
-validated = get_user(id)?
-  .validate()?
-  .update()
-
-// Range in match
-grade = match score {
-  90..100 = "A",
-  80..89 = "B",
-  _ = "F"
-}
-```
-
 ---
 
 ## Control Flow
@@ -822,6 +869,14 @@ action = match user.role {
   _ = guest_panel()
 }
 
+// Enum matching
+message = match user.status {
+  user_status.pending = "Awaiting approval",
+  user_status.active = "Account active",
+  user_status.suspended = "Account suspended",
+  user_status.deleted = "Account deleted"
+}
+
 // With guards
 grade = match {
   score >= 90 = "A",
@@ -838,19 +893,12 @@ result = match a <=> b {
   1 = "Greater than"
 }
 
-// Result matching
-match get_user(id) {
-  ok(user) = process(user),
-  err(e) = log_error(e)
-}
-
-// In components
+// In components (multi-branch rendering)
 <div>
-  {match status {
-    "loading" = <Spinner />,
-    "error" = <Error />,
-    "success" = <Content />,
-    _ = null
+  {match {
+    loading = <p>Loading...</p>,
+    error != null = <p class="error">{error}</p>,
+    _ = <Content data={data} />
   }}
 </div>
 ```
@@ -889,36 +937,62 @@ users
 
 ## Error Handling
 
-### Result Type
-```typescript
-// One-liner
-get_first_user(): result: user, error = 
-  Database.query("SELECT * FROM users").first()
+### Result Type and Automatic Propagation
 
-// Multi-line with explicit return
-get_user(id: int): result: user, error {
-  user = Database.query("SELECT * FROM users WHERE id = ?", [id])
-    .first()
+**When a function returns `result: T, error`, calling other result-returning functions automatically propagates errors:**
+
+```typescript
+// Errors propagate automatically in result functions
+expose get_user(id: int): result: user, error {
+  user = Database.query("SELECT * FROM users WHERE id = ?", [id]).first()
   
   if user == null {
-    return err("Not found")
+    return err("User not found")
   }
   
   return user
 }
+
+expose update_user(id: int, name: str): result: user, error {
+  // get_user error propagates automatically
+  existing = get_user(id)
+  
+  // Database error propagates automatically
+  return Database.update("users", id, { name: name })
+}
 ```
 
-### Error Propagation
+### Tuple Destructuring for Explicit Error Handling
+
+**Use Go-style tuple destructuring when you need explicit error handling:**
+
 ```typescript
-process_payment(user_id: int, amount: float): result: payment, error {
-  user = get_user(user_id)?      // Return early on error
-  balance = check_balance(user)?
+// Explicit error handling with tuple destructuring
+async load_user(user_id: int) {
+  loading.val = true
+  error.val = null
   
-  if balance < amount {
-    return err("Insufficient funds")
+  data, err = await get_user(user_id)
+  if err {
+    error.val = err
+    loading.val = false
+    return
   }
   
-  return charge(user, amount)
+  user.val = data
+  loading.val = false
+}
+
+// Guard clauses
+async save_user(name: str, email: str) {
+  updated, err = await update_user(user_id, name, email)
+  if err {
+    error.val = "Save failed: {err}"
+    return
+  }
+  
+  user.val = updated
+  editing.val = false
 }
 ```
 
@@ -940,6 +1014,180 @@ validate_user(user: user): result: bool, error {
   return true
 }
 ```
+
+---
+
+## Server-Client Communication
+
+### Expose API Endpoints
+
+**Use `expose` keyword to mark server functions as API endpoints:**
+
+```typescript
+// user_service.sx (Server)
+
+enum user_status {
+  pending: "pending",
+  active: "active",
+  suspended: "suspended",
+  deleted: "deleted"
+}
+
+type user {
+  id: int,
+  name: str,
+  email: str,
+  age: int,
+  status: user_status,
+  created_at: datetime
+}
+
+// Private function (server-only)
+validate_email(email: str): result: bool, error {
+  if email.empty() {
+    return err("Email required")
+  }
+  
+  if !email.includes("@") {
+    return err("Invalid email")
+  }
+  
+  return true
+}
+
+// Exposed - available to client
+expose get_user(id: int): result: user, error {
+  user = Database.query("SELECT * FROM users WHERE id = ?", [id]).first()
+  
+  if user == null {
+    return err("User not found")
+  }
+  
+  return user
+}
+
+expose create_user(name: str, email: str, age: int): result: user, error {
+  validate_email(email)
+  
+  if age < 18 {
+    return err("Must be 18 or older")
+  }
+  
+  return Database.insert("users", {
+    name: name,
+    email: email,
+    age: age,
+    status: user_status.pending,
+    created_at: now()
+  })
+}
+
+expose update_user_status(id: int, status: user_status): result: user, error {
+  existing = get_user(id)
+  
+  return Database.update("users", id, {
+    status: status
+  })
+}
+
+expose list_users(limit: int = 10): result: list: user, error {
+  return Database.query("SELECT * FROM users LIMIT {limit}").all()
+}
+```
+
+### Import and Call from Client
+
+**Import exposed functions directly - compiler generates HTTP client:**
+
+```typescript
+// profile.cx (Client)
+
+import { get_user, update_user_status, user_status } from "./user_service.sx"
+
+component UserProfile(user_id: int) {
+  user?: user = null
+  loading = true
+  error?: str = null
+  
+  async load_user() {
+    loading.val = true
+    error.val = null
+    
+    // Tuple destructuring for error handling
+    data, err = await get_user(user_id)
+    if err {
+      error.val = err
+      loading.val = false
+      return
+    }
+    
+    user.val = data
+    loading.val = false
+  }
+  
+  async suspend_user() {
+    updated, err = await update_user_status(user_id, user_status.suspended)
+    if err {
+      error.val = err
+      return
+    }
+    
+    user.val = updated
+  }
+  
+  on_mount(() = {
+    load_user()
+  })
+  
+  <div>
+    {loading && <p>Loading...</p>}
+    
+    {error && <p class="error">{error}</p>}
+    
+    {!loading && !error && user && (
+      <div>
+        <h1>{user.name}</h1>
+        <p>{user.email}</p>
+        <p>Age: {user.age}</p>
+        <p>Status: {match user.status {
+          user_status.pending = "⏳ Pending",
+          user_status.active = "✅ Active",
+          user_status.suspended = "🚫 Suspended",
+          user_status.deleted = "❌ Deleted"
+        }}</p>
+        
+        {user.status == user_status.active && (
+          <button @click={suspend_user}>Suspend User</button>
+        )}
+      </div>
+    )}
+  </div>
+}
+```
+
+### How It Works
+
+**Server (`.sx`):**
+- `expose` keyword marks functions as API endpoints
+- Regular functions stay server-only
+- Compiler generates HTTP endpoints: `/api/user_service/get_user`
+- Enums serialize to backing values in JSON
+
+**Client (`.cx`):**
+- Import exposed functions like normal imports
+- Import enums and types from server files
+- Compiler generates typed HTTP fetch calls
+- Same function signature on both sides
+- Full type safety across the boundary
+- Enums deserialize from backing values
+
+**Benefits:**
+✅ **Explicit** - `expose` shows API surface
+✅ **Type-safe** - Full checking across boundary
+✅ **No magic** - Direct function imports
+✅ **Secure** - Non-exposed functions can't be called
+✅ **Simple** - No separate API layer needed
+✅ **Enums travel** - Share enums between server and client
 
 ---
 
@@ -1012,14 +1260,49 @@ component UserProfile(user?: user) {
   </div>
 }
 
-component Dashboard(status: str) {
+component UserList() {
+  users: list: user = []
+  loading = true
+  error?: str = null
+  
+  async load_users() {
+    loading.val = true
+    error.val = null
+    
+    data, err = await list_users(20)
+    if err {
+      error.val = err
+      loading.val = false
+      return
+    }
+    
+    users.val = data
+    loading.val = false
+  }
+  
+  on_mount(() = {
+    load_users()
+  })
+  
   <div>
-    {match status {
-      "loading" = <Spinner />,
-      "error" = <ErrorMessage />,
-      "success" = <Content />,
-      _ = <div>Unknown status</div>
-    }}
+    {loading && <p>Loading users...</p>}
+    
+    {error && <p class="error">{error}</p>}
+    
+    {!loading && !error && (
+      <ul>
+        {users.map((u) = (
+          <li key={u.id}>
+            {u.name} - {u.email} - {match u.status {
+              user_status.pending = "Pending",
+              user_status.active = "Active",
+              user_status.suspended = "Suspended",
+              user_status.deleted = "Deleted"
+            }}
+          </li>
+        ))}
+      </ul>
+    )}
   </div>
 }
 ```
@@ -1029,15 +1312,25 @@ component Dashboard(status: str) {
 ## Modules
 
 ```typescript
-// Export
+// Export types and functions (available within project)
 export get_user(id: int): result: user, error { }
 export max_users = 1000
 export default UserService
+
+// Export enums
+export enum user_status {
+  pending: "pending",
+  active: "active"
+}
+
+// Expose (API endpoint - callable from client)
+expose get_user(id: int): result: user, error { }
 
 // Import
 import { get_user, create_user } from "./user_service.sx"
 import * as UserService from "./user_service.sx"
 import type { user } from "./types.sx"
+import { user_status } from "./user_service.sx"
 ```
 
 ---
@@ -1047,11 +1340,6 @@ import type { user } from "./types.sx"
 ```typescript
 async fetch_user(id: int): result: user, error {
   response = await http.get("/users/{id}")
-  
-  if response.status != 200 {
-    return err("Failed")
-  }
-  
   return json.decode(response.body)
 }
 
@@ -1061,6 +1349,19 @@ async fetch_user(id: int): result: user, error {
   fetch_posts(id),
   fetch_friends(id)
 ]
+
+// With tuple destructuring
+async load_data() {
+  user_data, user_err = await fetch_user(id)
+  if user_err {
+    return
+  }
+  
+  posts_data, posts_err = await fetch_posts(id)
+  if posts_err {
+    return
+  }
+}
 ```
 
 ---
@@ -1105,9 +1406,10 @@ regex = r"\d+\.\d+"
 ## Reserved Keywords
 
 ```
-async, await, break, catch, component, continue,
-enum, err, export, false, for, if, import, in,
-match, null, ok, return, true, try, type, unknown, while
+async, await, bool, break, catch, component, continue,
+enum, err, export, expose, false, float, for, if, 
+import, in, int, list, map, match, null, return, 
+set, str, true, try, type, unknown, while
 ```
 
 ---
@@ -1117,16 +1419,50 @@ match, null, ok, return, true, try, type, unknown, while
 ```typescript
 // user_service.sx (Server)
 
+enum user_status {
+  pending: "pending",
+  active: "active",
+  suspended: "suspended",
+  deleted: "deleted"
+}
+
+enum user_role {
+  admin: "admin",
+  moderator: "moderator",
+  user: "user",
+  guest: "guest"
+}
+
 type user {
   id: int,
   name: str,
   email: str,
+  age: int,
+  status: user_status,
+  role: user_role,
   created_at: datetime
 }
 
-export get_user(id: int): result: user, error {
-  user = Database.query("SELECT * FROM users WHERE id = ?", [id])
-    .first()
+type create_user_request {
+  name: str,
+  email: str,
+  age: int
+}
+
+validate_email(email: str): result: bool, error {
+  if email.empty() {
+    return err("Email required")
+  }
+  
+  if !email.includes("@") {
+    return err("Invalid email format")
+  }
+  
+  return true
+}
+
+expose get_user(id: int): result: user, error {
+  user = Database.query("SELECT * FROM users WHERE id = ?", [id]).first()
   
   if user == null {
     return err("User not found")
@@ -1135,46 +1471,63 @@ export get_user(id: int): result: user, error {
   return user
 }
 
-export create_user(name: str, email: str): result: user, error {
-  if email.empty() {
-    return err("Email required")
-  }
+expose create_user(request: create_user_request): result: user, error {
+  validate_email(request.email)
   
-  if !email.includes("@") {
-    return err("Invalid email")
+  if request.age < 18 {
+    return err("Must be 18 or older")
   }
   
   user = Database.insert("users", {
-    name,
-    email,
+    name: request.name,
+    email: request.email,
+    age: request.age,
+    status: user_status.pending,
+    role: user_role.user,
     created_at: now()
-  })?
+  })
   
   return user
 }
 
-export get_users_sorted_by_name(): list: user {
-  users = Database.query("SELECT * FROM users").all()
-  return users.sort((a, b) = a.name <=> b.name)
+expose list_users(limit: int = 10, offset: int = 0): result: list: user, error {
+  return Database.query(
+    "SELECT * FROM users LIMIT {limit} OFFSET {offset}"
+  ).all()
 }
 
-export get_total_score(user_id: int): int {
-  scores = Database.query("SELECT score FROM games WHERE user_id = ?", [user_id])
-    .all()
-  return scores.sum()
+expose update_user_status(id: int, status: user_status): result: user, error {
+  existing = get_user(id)
+  
+  return Database.update("users", id, {
+    status: status
+  })
 }
 
-// Parse API response with type checking
-export async fetch_external_user(api_id: str): result: user, error {
+expose update_user_role(id: int, role: user_role): result: user, error {
+  existing = get_user(id)
+  
+  return Database.update("users", id, {
+    role: role
+  })
+}
+
+log_user_action(user_id: int, action: str) {
+  Database.insert("audit_log", {
+    user_id: user_id,
+    action: action,
+    timestamp: now()
+  })
+}
+```
+
+```typescript
+// external_api.sx (Server)
+
+expose fetch_external_user(api_id: str): result: user, error {
   response = await http.get("https://api.example.com/users/{api_id}")
-  
-  if response.status != 200 {
-    return err("API request failed")
-  }
-  
   data = json.parse(response.body)
   
-  // Type check and validate
   if !data.is_map() {
     return err("Invalid response format")
   }
@@ -1183,41 +1536,71 @@ export async fetch_external_user(api_id: str): result: user, error {
     return err("Missing or invalid name")
   }
   
-  // Age might be string or int - handle both
   age_value = data.get("age")
-  age = match {
-    age_value.is_int() = age_value,
-    age_value.is_str() = age_value.to_int()?,
-    _ = return err("Invalid age")
-  }
+  age = age_value.is_int() ? age_value : int(age_value)
   
-  return create_user(data.get("name"), age)
+  // Parse status from API
+  status_str = str(data.get("status"))
+  status = user_status.from(status_str) ?: user_status.pending
+  
+  return create_user({
+    name: str(data.get("name")),
+    email: str(data.get("email")) ?: "",
+    age: age
+  })
 }
 ```
 
 ```typescript
 // user_profile.cx (Client)
 
-import { api } from "./api.cx"
+import { 
+  get_user, 
+  update_user_status, 
+  update_user_role,
+  user_status,
+  user_role
+} from "./user_service.sx"
 
 component UserProfile(user_id: int) {
-  user?: object = null
+  user?: user = null
   loading = true
   error?: str = null
+  editing = false
   
   async load_user() {
     loading.val = true
+    error.val = null
     
-    match await api.get_user(user_id) {
-      ok(data) = {
-        user.val = data
-        loading.val = false
-      },
-      err(e) = {
-        error.val = e
-        loading.val = false
-      }
+    data, err = await get_user(user_id)
+    if err {
+      error.val = err
+      loading.val = false
+      return
     }
+    
+    user.val = data
+    loading.val = false
+  }
+  
+  async change_status(new_status: user_status) {
+    updated, err = await update_user_status(user_id, new_status)
+    if err {
+      error.val = err
+      return
+    }
+    
+    user.val = updated
+  }
+  
+  async change_role(new_role: user_role) {
+    updated, err = await update_user_role(user_id, new_role)
+    if err {
+      error.val = err
+      return
+    }
+    
+    user.val = updated
   }
   
   on_mount(() = {
@@ -1225,17 +1608,62 @@ component UserProfile(user_id: int) {
   })
   
   <div>
-    {match {
-      loading = <p>Loading...</p>,
-      error != null = <p class="error">{error}</p>,
-      _ = (
+    {loading && <p>Loading...</p>}
+    
+    {error && <p class="error">{error}</p>}
+    
+    {!loading && !error && user && (
+      <div>
+        <h1>{user.name}</h1>
+        <p>{user.email}</p>
+        <p>Age: {user.age}</p>
+        
         <div>
-          <h1>{user.name ?: "No name"}</h1>
-          <p>{user.email ?: "No email"}</p>
-          <p>Joined: {user.created_at.format("MMM DD, YYYY")}</p>
+          <strong>Status:</strong>
+          {match user.status {
+            user_status.pending = <span class="badge pending">⏳ Pending</span>,
+            user_status.active = <span class="badge active">✅ Active</span>,
+            user_status.suspended = <span class="badge suspended">🚫 Suspended</span>,
+            user_status.deleted = <span class="badge deleted">❌ Deleted</span>
+          }}
         </div>
-      )
-    }}
+        
+        <div>
+          <strong>Role:</strong>
+          {match user.role {
+            user_role.admin = <span class="badge admin">👑 Admin</span>,
+            user_role.moderator = <span class="badge mod">🛡️ Moderator</span>,
+            user_role.user = <span class="badge user">👤 User</span>,
+            user_role.guest = <span class="badge guest">🔓 Guest</span>
+          }}
+        </div>
+        
+        <div class="actions">
+          {user.status == user_status.active && (
+            <button @click={() = change_status(user_status.suspended)}>
+              Suspend User
+            </button>
+          )}
+          
+          {user.status == user_status.suspended && (
+            <button @click={() = change_status(user_status.active)}>
+              Activate User
+            </button>
+          )}
+          
+          <select @change={(e) = change_role(user_role.from(e.target.value))}>
+            {user_role.values().map((role) = (
+              <option 
+                value={role.value} 
+                selected={user.role == role}
+              >
+                {role.value}
+              </option>
+            ))}
+          </select>
+        </div>
+      </div>
+    )}
   </div>
 }
 ```
@@ -1250,6 +1678,7 @@ project/
 │   ├── server/
 │   │   ├── user_service.sx
 │   │   ├── auth_service.sx
+│   │   ├── types.sx
 │   │   └── database.sx
 │   ├── client/
 │   │   ├── components/
@@ -1258,7 +1687,7 @@ project/
 │   │   └── utils/
 │   │       └── api.cx
 │   └── shared/
-│       └── types.sx
+│       └── enums.sx
 ├── tests/
 │   ├── user_service_test.sx
 │   └── components_test.cx
@@ -1272,8 +1701,11 @@ project/
 ### Use Guard Clauses
 Check error conditions early and return. Happy path stays at the main level.
 
-### Explicit Returns in Multi-Line Functions
-Use explicit `return` statements in multi-line functions for clarity.
+### Tuple Destructuring for Error Handling
+Use `data, err = function()` pattern for explicit error handling in client code.
+
+### Automatic Error Propagation
+In `result`-returning functions, errors propagate automatically - no manual checking needed.
 
 ### Use Strict Equality
 Rivo only has `==` and it's always strict (checks type and value). No need to remember `===`.
@@ -1281,8 +1713,17 @@ Rivo only has `==` and it's always strict (checks type and value). No need to re
 ### Type Check Unknown Data
 When working with JSON or dynamic data, always use `.is_*()` methods before accessing.
 
-### Convert Types Explicitly
-Use `.to_*()` methods for explicit type conversion. No implicit coercion.
+### Cast Types Explicitly
+Use `int()`, `str()`, `float()`, `bool()` for explicit type conversion. No implicit coercion.
+
+### Use Backed Enums
+Define enums with explicit backing values for database storage and API serialization.
+
+### Expose Only What's Needed
+Use `expose` sparingly - only mark functions that should be callable from the client.
+
+### Share Enums Between Server and Client
+Import enums in client code to ensure type safety across the boundary.
 
 ### Prefer Match for Multi-Branch
 When you have more than two conditions, use `match` instead of nested ternaries.
