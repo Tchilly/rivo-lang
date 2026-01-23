@@ -26,19 +26,28 @@ Rivo is built on **CLEAR** - a pragmatic approach to modern software development
 
 ## Execution Contexts
 
-| Extension | Context | Access |
-|-----------|---------|--------|
-| `.sx` | Server execution | Database, filesystem, env vars, secrets |
-| `.cx` | Client execution | DOM, browser APIs, local storage |
+| Extension | Context | Access | Similar To |
+|-----------|---------|--------|------------|
+| `.sx` | Server execution | Database, filesystem, env vars, secrets | Node.js / server-side TS |
+| `.sc` | Server component | HTML + props from `.sx`, compiled on server before passing to client | SSR / RSC |
+| `.cx` | Client execution | DOM, browser APIs, local storage | Browser JS / client TS |
 
 **Rules:**
 - `.sx` files never bundle to client (compiler enforced)
-- `.cx` files cannot import `.sx` modules (compiler enforced)
+- `.sc` files render on server, can hydrate with `.sx` functions
+- `.cx` files run only in browser, can hydrate with `.sx` functions
+- `.cx` files cannot import non-exposed `.sx` internals (compiler enforced)
+- `.cx` and `.sc` files CAN import `exposed` functions, types, and enums from `.sx` modules
 - Communication between contexts happens through explicit APIs
 
+**Hydration:**
+- `.sc` components render HTML on server, hydrate interactivity on client
+- `.cx` components render entirely on client
+- Both can call `exposed` functions from `.sx` files
+
 ```typescript
-// user_service.sx - Server only
-expose get_user(id: int): result: user, error {
+// user_service.sx - Server only (data layer)
+expose get_user(id: int): result<user, error> {
   user = Database.query("SELECT * FROM users WHERE id = ?", [id]).first()
   
   if user == null {
@@ -48,12 +57,61 @@ expose get_user(id: int): result: user, error {
   return user
 }
 
-// profile.cx - Client only
+// user_card.sc - Server component (SSR)
 import { get_user } from "./user_service.sx"
 
-// Compiler generates HTTP client call
-data, err = await get_user(123)
+component UserCard(user_id: int) {
+  // Runs on server during render
+  user, err = await get_user(user_id)
+  
+  if err {
+    return <p class="error">Failed to load user</p>
+  }
+  
+  // HTML rendered on server, sent to client
+  <div class="user-card">
+    <h2>{user.name}</h2>
+    <p>{user.email}</p>
+  </div>
+}
+
+// interactive_button.cx - Client component (interactive)
+import { update_user_status, user_status } from "./user_service.sx"
+
+component InteractiveButton(user_id: int, initial_status: user_status) {
+  status = initial_status
+  loading = false
+  
+  async toggle() {
+    loading.value = true
+    new_status = status == user_status.active 
+      ? user_status.suspended 
+      : user_status.active
+    
+    updated, err = await update_user_status(user_id, new_status)
+    if !err {
+      status.value = updated.status
+    }
+    loading.value = false
+  }
+  
+  <button @click={toggle} disabled={loading}>
+    {loading ? "..." : (status == user_status.active ? "Suspend" : "Activate")}
+  </button>
+}
 ```
+
+### Context Comparison
+
+| Feature | `.sx` | `.sc` | `.cx` |
+|---------|-------|-------|-------|
+| Runs on server | ✅ | ✅ (render) | ❌ |
+| Runs on client | ❌ | ✅ (hydrate) | ✅ |
+| Database access | ✅ | Via `.sx` | Via `.sx` |
+| DOM access | ❌ | ❌ | ✅ |
+| Renders HTML | ❌ | ✅ (SSR) | ✅ (CSR) |
+| Interactive | ❌ | With `.cx` children | ✅ |
+| SEO friendly | N/A | ✅ | ❌ |
 
 ---
 
@@ -71,17 +129,19 @@ api_url = "https://api.com"
 // Reassignment fails
 name = "Jane"  // Error
 
-// Mutation with .val
+// Mutation with .value
 count = 0
-count.val = 5      // Declare intent to mutate
-count.val += 1     // Mutate
+count.value = 5      // Declare intent to mutate
+count.value += 1     // Mutate
 
-// Reading (no .val)
-print(count)       // Outputs: 6
+// Reading (no .value needed)
+print(count)         // Outputs: 6
 total = count + 5
 
 // Compiler optimizes constants automatically
 ```
+
+**Note:** `.value` is a reserved accessor for mutation. Primitives are internally wrapped objects, so user-defined types cannot have a `.value` property that conflicts.
 
 ---
 
@@ -91,39 +151,62 @@ total = count + 5
 ```typescript
 int, float, str, bool
 datetime, date, time
+null                 // Intentional absence of value
+undefined            // Uninitialized or missing value (useful for JSON)
 ```
 
 ### Collections
 ```typescript
-list: T          // Ordered, indexed, duplicates allowed
-map: K, V        // Key-value pairs, unique keys
-set: T           // Unique values, unordered
+list<T>              // Ordered, indexed, duplicates allowed
+map<K, V>            // Key-value pairs, unique keys
+set<T>               // Unique values, unordered
+```
+
+### Tuples
+```typescript
+tuple<T, U>          // Fixed-size, heterogeneous (2 elements)
+tuple<T, U, V>       // Can have 2+ elements
+
+// Examples
+point = (10, 20)                            // tuple<int, int>
+entry = ("alice", 100)                      // tuple<str, int>
+record: tuple<str, int, bool> = ("a", 1, true)
+
+// Destructuring
+(name, score) = entry
+(x, y) = point
+
+// Used by map.entries()
+scores.entries()     // list<tuple<str, int>>
 ```
 
 ### Type Inference from Literals
 ```typescript
 // Inferred from literal
-numbers = [1, 2, 3]                    // list: int
-scores = { "a": 1, "b": 2 }            // map: str, int
-tags = set(["rust", "go"])             // set: str
+numbers = [1, 2, 3]                    // list<int>
+scores = { "a": 1, "b": 2 }            // map<str, int>
+tags = set(["rust", "go"])             // set<str>
+point = (10, 20)                       // tuple<int, int>
 
 // Explicit types when needed
-users: list: user = []
-config: map: str, str = {}
-ids: set: int = set([])
+users: list<user> = []
+config: map<str, str> = {}
+ids: set<int> = set([])
+coords: tuple<float, float> = (0.0, 0.0)
 ```
 
 ### Special Types
 ```typescript
-result: T, E    // Success or error
-option: T       // Some or None
+result<T, E>    // Success or error
+option<T>       // Some or None
+error           // Error type (contains message: str, code?: int)
 unknown         // Dynamic/unknown type (for JSON, etc.)
 ```
 
 ### Nullable
 ```typescript
 name: str       // Cannot be null
-email?: str     // Can be null
+email?: str     // Can be null or undefined
 
 // Optional chaining
 user?.address?.city
@@ -246,9 +329,11 @@ value.is_float()            // true if float
 value.is_str()              // true if string
 value.is_bool()             // true if boolean
 value.is_null()             // true if null
+value.is_undefined()        // true if undefined
 value.is_list()             // true if list
 value.is_map()              // true if map
 value.is_set()              // true if set
+value.is_tuple()            // true if tuple
 ```
 
 ### Type Casting Functions
@@ -263,10 +348,20 @@ bool(value)                 // Cast to boolean
 age = int("42")             // 42
 price = float("19.99")      // 19.99
 text = str(123)             // "123"
+
+// Boolean casting - strict accepted values only
 flag = bool("true")         // true
+flag = bool("false")        // false
+flag = bool(1)              // true
+flag = bool(0)              // false
+
+// These throw errors:
+bool("")                    // Error: invalid boolean value
+bool("yes")                 // Error: invalid boolean value
+bool("1")                   // Error: use int() first, then bool()
 
 // Casting returns result types - errors propagate automatically
-expose process_age(input: str): result: int, error {
+expose process_age(input: str): result<int, error> {
   age = int(input)          // Errors propagate
   
   if age < 0 {
@@ -289,6 +384,10 @@ if err {
 numbers = [1, 2, 2, 3]
 unique = set(numbers)       // set([1, 2, 3])
 back = list(unique)         // [1, 2, 3] (order undefined)
+
+// Tuple to list
+point = (10, 20)
+coords = list(point)        // [10, 20]
 ```
 
 ### Comparison with Casting
@@ -299,42 +398,80 @@ back = list(unique)         // [1, 2, 3] (order undefined)
 str(3) == "3"               // true
 ```
 
-### Working with JSON and Unknown Types
+### Schema Validation
+
+**Validate unknown data against a type. Errors propagate automatically.**
+
 ```typescript
-// Parse API response (returns unknown type)
-expose fetch_user(id: int): result: user, error {
+// Define types for API responses
+type user_response {
+  id: int,
+  name: str,
+  email?: str,
+  age?: int
+}
+
+type order_response {
+  id: int,
+  total: float,
+  items: list<order_item>,
+  customer: customer_info
+}
+
+type order_item {
+  product_id: int,
+  quantity: int,
+  price: float
+}
+
+type customer_info {
+  id: int,
+  name: str,
+  email?: str
+}
+
+// Validate against type
+data = json.parse(input).validate(user_response)
+// data is now typed as user_response
+
+// Use in functions
+expose fetch_user(id: int): result<user, error> {
   response = await http.get("/users/{id}")
-  data = json.parse(response.body)
-  
-  if !data.is_map() {
-    return err("Invalid response format")
-  }
-  
-  if !data.has("id") || !data.get("id").is_int() {
-    return err("Missing or invalid id")
-  }
-  
-  if !data.has("name") || !data.get("name").is_str() {
-    return err("Missing or invalid name")
-  }
-  
-  // Handle flexible types - cast as needed
-  age_value = data.get("age")
-  age = age_value.is_int() ? age_value : int(age_value)
-  
-  // Parse enum from backing value
-  status_str = str(data.get("status"))
-  status = user_status.from(status_str) ?: user_status.pending
+  data = json.parse(response.body).validate(user_response)
   
   return {
-    id: data.get("id"),
-    name: data.get("name"),
-    age: age,
-    status: status
+    id: data.id,
+    name: data.name,
+    age: data.age ?: 0,
+    status: user_status.from(data.status) ?: user_status.pending
   }
 }
 
-// Filter by type
+expose fetch_order(id: int): result<order, error> {
+  response = await http.get("/orders/{id}")
+  data = json.parse(response.body).validate(order_response)
+  
+  return data
+}
+
+// Enums in types validate against backing values
+type task_response {
+  id: int,
+  title: str,
+  priority: priority,      // Validates 1, 2, 3, or 4
+  status: task_status      // Validates "pending", "active", etc.
+}
+
+// Union types in validation
+type flexible_response {
+  id: int | str,           // Accept either
+  count: int | null        // Accept int or null
+}
+
+// Custom error message
+data = json.parse(input).validate(user_response, "Invalid API response")
+
+// Filter by type (for truly dynamic data)
 mixed = [1, "hello", 3.14, true, null]
 numbers = mixed.filter((v) = v.is_int())     // [1]
 strings = mixed.filter((v) = v.is_str())     // ["hello"]
@@ -355,12 +492,27 @@ add(a: int, b: int) = a + b
 // One-liner, explicit type - implicit return
 add(a: int, b: int): int = a + b
 
+// One-liner with conditional - use ternary
+max(a: int, b: int): int = a > b ? a : b
+
 // Multi-line - explicit return required
 add(a: int, b: int): int {
   result = a + b
   log("Adding {a} + {b}")
   return result
 }
+```
+
+### Function Declaration Syntax
+
+The parser treats `identifier(params) =` or `identifier(params) {` as a function declaration:
+
+```typescript
+// This is a function declaration that calls another function
+result(data: str) = process(data)
+
+// Variable assignment is different - no parameters
+result = calculate(5)    // Calls calculate(), assigns return value to result
 ```
 
 ### Examples
@@ -375,15 +527,15 @@ double(n: int): int = n * 2
 format_name(first: str, last: str): str = "{first} {last}"
 
 // Generic return types
-fetch_users(limit: int = 10): list: user = 
+fetch_users(limit: int = 10): list<user> = 
   Database.query("SELECT * FROM users LIMIT {limit}")
 
 // Result types - one-liner
-get_first_user(): result: user, error = 
+get_first_user(): result<user, error> = 
   Database.query("SELECT * FROM users").first()
 
 // Result types - multi-line with explicit return
-get_user(id: int): result: user, error {
+get_user(id: int): result<user, error> {
   user = Database.query("SELECT * FROM users WHERE id = ?", [id])
     .first()
   
@@ -395,7 +547,7 @@ get_user(id: int): result: user, error {
 }
 
 // Optional parameters
-fetch_users(limit: int, offset?: int): list: user {
+fetch_users(limit: int, offset?: int): list<user> {
   query = "SELECT * FROM users LIMIT {limit}"
   if offset != null {
     query += " OFFSET {offset}"
@@ -409,6 +561,21 @@ users.filter((u) = u.active)
 items.reduce(0, (acc, i) = acc + i)
 ```
 
+### Lambda Returns
+
+```typescript
+// Return exits the lambda, not the outer function
+processed = items.map((item) = {
+  if item.invalid {
+    return null  // Returns null from this lambda only
+  }
+  return item.value
+})
+
+// Outer function continues after map completes
+print(processed)
+```
+
 ---
 
 ## Collections
@@ -418,12 +585,12 @@ items.reduce(0, (acc, i) = acc + i)
 ```typescript
 // Creation
 numbers = [1, 2, 3, 1, 2]
-users: list: user = []
+users: list<user> = []
 empty = []
 
 // Common API
 numbers.count()             // 5 (number of elements)
-numbers.empty()             // false
+numbers.is_empty()          // false
 numbers.clear()             // Remove all
 numbers.has(2)              // true (contains check)
 
@@ -437,7 +604,6 @@ numbers.get(0)              // 1 (value at index)
 numbers.set(0, 10)          // Set index 0 to 10
 numbers.add(4)              // Append to end
 numbers.delete(0)           // Remove at index 0
-numbers.remove(2)           // Remove first occurrence of value 2
 
 // Boundaries
 numbers.first()             // First element
@@ -460,24 +626,24 @@ numbers.each((n) = print(n))
 ```typescript
 // Creation
 scores = { "alice": 100, "bob": 85 }
-config: map: str, int = {}
+config: map<str, int> = {}
 empty = {}
 
 // Common API
 scores.count()              // 2 (number of keys)
-scores.empty()              // false
+scores.is_empty()           // false
 scores.clear()              // Remove all
 scores.has("alice")         // true (key exists)
 
 // Access and modification
-scores.get("alice")         // option: int (Some(100) or None)
+scores.get("alice")         // option<int> (Some(100) or None)
 scores.set("alice", 95)     // Set key "alice" to 95
 scores.delete("alice")      // Remove key "alice"
 
 // Views
-scores.keys()               // list: str
-scores.values()             // list: int
-scores.entries()            // list: (str, int)
+scores.keys()               // list<str>
+scores.values()             // list<int>
+scores.entries()            // list<tuple<str, int>>
 
 // Iteration
 scores.map((k, v) = v * 2)
@@ -496,12 +662,12 @@ score = scores.get("alice") ?? 0
 ```typescript
 // Creation
 tags = set(["rust", "go", "python"])
-ids: set: int = set([])
+ids: set<int> = set([])
 empty = set([])
 
 // Common API
 tags.count()                // 3 (number of elements)
-tags.empty()                // false
+tags.is_empty()             // false
 tags.clear()                // Remove all
 tags.has("rust")            // true (value exists)
 
@@ -538,7 +704,7 @@ tags.each((t) = print(t))
 | Method | List | Map | Set | Description |
 |--------|------|-----|-----|-------------|
 | `.count()` | ✓ | ✓ | ✓ | Number of elements/keys |
-| `.empty()` | ✓ | ✓ | ✓ | Is collection empty |
+| `.is_empty()` | ✓ | ✓ | ✓ | Is collection empty |
 | `.clear()` | ✓ | ✓ | ✓ | Remove all elements |
 | `.has(value/key)` | ✓ | ✓ | ✓ | Check existence |
 | `.sum()` | ✓ | - | ✓ | Sum numeric values |
@@ -560,12 +726,12 @@ numbers = [1, 2, 3]
 numbers.add(4)              // Mutates in place
 numbers.set(0, 10)          // Mutates in place
 
-// No .val needed for collection methods
+// No .value needed for collection methods
 // (Unlike primitive reassignment)
 
-// Reassignment still requires .val
+// Reassignment still requires .value
 numbers = [5, 6, 7]         // Error
-numbers.val = [5, 6, 7]     // OK
+numbers.value = [5, 6, 7]   // OK
 ```
 
 ---
@@ -577,7 +743,7 @@ numbers.val = [5, 6, 7]     // OK
 scores = { "alice": 100 }
 
 result = scores.get("alice")
-// result is option: int
+// result is option<int>
 
 // Use default operators
 score = scores.get("alice") ?: 0
@@ -656,13 +822,13 @@ user.admin || user.moderator
 ### Assignment
 ```typescript
 name = value           // Immutable assignment
-name.val = value       // Mutable assignment
+name.value = value     // Mutable assignment
 
-// Compound assignment (requires .val)
-count.val += 1
-count.val -= 5
-count.val *= 2
-count.val /= 3
+// Compound assignment (requires .value)
+count.value += 1
+count.value -= 5
+count.value *= 2
+count.value /= 3
 ```
 
 ### Range
@@ -740,16 +906,16 @@ message = "Hello, {name}!"
 ```typescript
 .           // Property access
 ?.          // Optional property access
-.val        // Mutation accessor
+.value      // Mutation accessor
 
 user.name
 user?.email
-count.val = 5
+count.value = 5
 ```
 
 ### Function
 ```typescript
-=           // Lambda definition
+=           // Lambda/function definition
 ()          // Function call
 .           // Method call
 
@@ -762,10 +928,13 @@ items.filter((i) = i.active)
 ### Type
 ```typescript
 :           // Type annotation
+<>          // Generic type parameters
 |           // Union type
 ?           // Optional/nullable
 
 name: str
+users: list<user>
+config: map<str, list<int>>
 id: int | str
 email?: str
 ```
@@ -818,9 +987,12 @@ status = active ? "online" : "offline"
 
 ## Control Flow
 
-### If (Single Check)
+### If (Guard Clauses)
+
+Rivo uses `if` for guard clauses and early returns only. There is no `else` keyword.
+
 ```typescript
-// Guard clauses
+// Guard clauses - check and return early
 if !user.verified {
   return err("Not verified")
 }
@@ -829,9 +1001,45 @@ if user.banned {
   return err("User banned")
 }
 
-// Single condition
+// Happy path continues here...
+process_user(user)
+
+// Single condition side effects
 if loading {
   show_spinner()
+}
+```
+
+### Why No `else`?
+
+Rivo intentionally omits `else`. This encourages cleaner patterns:
+
+- **Guard clauses** - Handle error cases early, keep happy path at main indentation
+- **Ternary** - For simple either/or value expressions
+- **Match** - For multi-branch logic
+
+```typescript
+// ❌ Instead of nested if-else:
+// if condition {
+//   do_a()
+// } else {
+//   do_b()
+// }
+
+// ✅ Use ternary for values:
+result = condition ? value_a : value_b
+
+// ✅ Use guard clause + continue:
+if !condition {
+  return
+}
+do_a()
+
+// ✅ Use match for multiple branches:
+result = match {
+  condition_a = value_a,
+  condition_b = value_b,
+  _ = default_value
 }
 ```
 
@@ -877,7 +1085,7 @@ message = match user.status {
   user_status.deleted = "Account deleted"
 }
 
-// With guards
+// With guards (condition-based matching)
 grade = match {
   score >= 90 = "A",
   score >= 80 = "B",
@@ -923,6 +1131,17 @@ for i in 0..<10 {
 while condition {
   process()
 }
+
+// Break and continue work as expected
+for item in items {
+  if item.skip {
+    continue
+  }
+  if item.done {
+    break
+  }
+  process(item)
+}
 ```
 
 ### Method Chaining
@@ -939,11 +1158,11 @@ users
 
 ### Result Type and Automatic Propagation
 
-**When a function returns `result: T, error`, calling other result-returning functions automatically propagates errors:**
+**When a function returns `result<T, error>`, calling other result-returning functions automatically propagates errors:**
 
 ```typescript
 // Errors propagate automatically in result functions
-expose get_user(id: int): result: user, error {
+expose get_user(id: int): result<user, error> {
   user = Database.query("SELECT * FROM users WHERE id = ?", [id]).first()
   
   if user == null {
@@ -953,7 +1172,7 @@ expose get_user(id: int): result: user, error {
   return user
 }
 
-expose update_user(id: int, name: str): result: user, error {
+expose update_user(id: int, name: str): result<user, error> {
   // get_user error propagates automatically
   existing = get_user(id)
   
@@ -969,37 +1188,37 @@ expose update_user(id: int, name: str): result: user, error {
 ```typescript
 // Explicit error handling with tuple destructuring
 async load_user(user_id: int) {
-  loading.val = true
-  error.val = null
+  loading.value = true
+  error.value = null
   
   data, err = await get_user(user_id)
   if err {
-    error.val = err
-    loading.val = false
+    error.value = err
+    loading.value = false
     return
   }
   
-  user.val = data
-  loading.val = false
+  user.value = data
+  loading.value = false
 }
 
 // Guard clauses
 async save_user(name: str, email: str) {
   updated, err = await update_user(user_id, name, email)
   if err {
-    error.val = "Save failed: {err}"
+    error.value = "Save failed: {err}"
     return
   }
   
-  user.val = updated
-  editing.val = false
+  user.value = updated
+  editing.value = false
 }
 ```
 
 ### Guard Clauses
 ```typescript
-validate_user(user: user): result: bool, error {
-  if user.email.empty() {
+validate_user(user: user): result<bool, error> {
+  if user.email.is_empty() {
     return err("Email required")
   }
   
@@ -1043,8 +1262,8 @@ type user {
 }
 
 // Private function (server-only)
-validate_email(email: str): result: bool, error {
-  if email.empty() {
+validate_email(email: str): result<bool, error> {
+  if email.is_empty() {
     return err("Email required")
   }
   
@@ -1056,7 +1275,7 @@ validate_email(email: str): result: bool, error {
 }
 
 // Exposed - available to client
-expose get_user(id: int): result: user, error {
+expose get_user(id: int): result<user, error> {
   user = Database.query("SELECT * FROM users WHERE id = ?", [id]).first()
   
   if user == null {
@@ -1066,7 +1285,7 @@ expose get_user(id: int): result: user, error {
   return user
 }
 
-expose create_user(name: str, email: str, age: int): result: user, error {
+expose create_user(name: str, email: str, age: int): result<user, error> {
   validate_email(email)
   
   if age < 18 {
@@ -1082,7 +1301,7 @@ expose create_user(name: str, email: str, age: int): result: user, error {
   })
 }
 
-expose update_user_status(id: int, status: user_status): result: user, error {
+expose update_user_status(id: int, status: user_status): result<user, error> {
   existing = get_user(id)
   
   return Database.update("users", id, {
@@ -1090,77 +1309,100 @@ expose update_user_status(id: int, status: user_status): result: user, error {
   })
 }
 
-expose list_users(limit: int = 10): result: list: user, error {
+expose list_users(limit: int = 10): result<list<user>, error> {
   return Database.query("SELECT * FROM users LIMIT {limit}").all()
 }
 ```
 
-### Import and Call from Client
+### Import and Call from Components
 
-**Import exposed functions directly - compiler generates HTTP client:**
+**Import exposed functions in both `.sc` and `.cx` files:**
 
 ```typescript
-// profile.cx (Client)
+// user_card.sc (Server Component - SSR)
+import { get_user, user_status } from "./user_service.sx"
 
-import { get_user, update_user_status, user_status } from "./user_service.sx"
+component UserCard(user_id: int) {
+  // Runs on server during render - direct call, no HTTP
+  user, err = await get_user(user_id)
+  
+  if err {
+    return <p class="error">Failed to load user</p>
+  }
+  
+  <div class="user-card">
+    <h2>{user.name}</h2>
+    <p>{user.email}</p>
+    <span class="status">{match user.status {
+      user_status.pending = "⏳ Pending",
+      user_status.active = "✅ Active",
+      user_status.suspended = "🚫 Suspended",
+      user_status.deleted = "❌ Deleted"
+    }}</span>
+  </div>
+}
+```
 
-component UserProfile(user_id: int) {
-  user?: user = null
-  loading = true
+```typescript
+// status_toggle.cx (Client Component - Interactive)
+import { update_user_status, user_status } from "./user_service.sx"
+
+component StatusToggle(user_id: int, initial_status: user_status) {
+  status = initial_status
+  loading = false
   error?: str = null
   
-  async load_user() {
-    loading.val = true
-    error.val = null
+  async toggle() {
+    loading.value = true
+    error.value = null
     
-    // Tuple destructuring for error handling
-    data, err = await get_user(user_id)
+    new_status = status == user_status.active 
+      ? user_status.suspended 
+      : user_status.active
+    
+    // Compiler generates HTTP client call
+    updated, err = await update_user_status(user_id, new_status)
     if err {
-      error.val = err
-      loading.val = false
+      error.value = err
+      loading.value = false
       return
     }
     
-    user.val = data
-    loading.val = false
+    status.value = updated.status
+    loading.value = false
   }
-  
-  async suspend_user() {
-    updated, err = await update_user_status(user_id, user_status.suspended)
-    if err {
-      error.val = err
-      return
-    }
-    
-    user.val = updated
-  }
-  
-  on_mount(() = {
-    load_user()
-  })
   
   <div>
-    {loading && <p>Loading...</p>}
-    
     {error && <p class="error">{error}</p>}
+    <button @click={toggle} disabled={loading}>
+      {loading ? "..." : (status == user_status.active ? "Suspend" : "Activate")}
+    </button>
+  </div>
+}
+```
+
+```typescript
+// profile_page.sc (Server Component with Client Interactivity)
+import { get_user, user_status } from "./user_service.sx"
+import { StatusToggle } from "./status_toggle.cx"
+
+component ProfilePage(user_id: int) {
+  user, err = await get_user(user_id)
+  
+  if err {
+    return <p>User not found</p>
+  }
+  
+  // Static content rendered on server
+  // StatusToggle hydrates on client for interactivity
+  <div class="profile">
+    <h1>{user.name}</h1>
+    <p>{user.email}</p>
+    <p>Age: {user.age}</p>
+    <p>Member since: {user.created_at.format("MMMM D, YYYY")}</p>
     
-    {!loading && !error && user && (
-      <div>
-        <h1>{user.name}</h1>
-        <p>{user.email}</p>
-        <p>Age: {user.age}</p>
-        <p>Status: {match user.status {
-          user_status.pending = "⏳ Pending",
-          user_status.active = "✅ Active",
-          user_status.suspended = "🚫 Suspended",
-          user_status.deleted = "❌ Deleted"
-        }}</p>
-        
-        {user.status == user_status.active && (
-          <button @click={suspend_user}>Suspend User</button>
-        )}
-      </div>
-    )}
+    // Client component embedded in server component
+    <StatusToggle user_id={user_id} initial_status={user.status} />
   </div>
 }
 ```
@@ -1173,36 +1415,105 @@ component UserProfile(user_id: int) {
 - Compiler generates HTTP endpoints: `/api/user_service/get_user`
 - Enums serialize to backing values in JSON
 
-**Client (`.cx`):**
-- Import exposed functions like normal imports
-- Import enums and types from server files
-- Compiler generates typed HTTP fetch calls
-- Same function signature on both sides
-- Full type safety across the boundary
-- Enums deserialize from backing values
+**Server Components (`.sc`):**
+- Render HTML on server
+- Can call `.sx` functions directly (no HTTP overhead)
+- Can embed `.cx` components for interactivity
+- Output is sent as HTML + hydration data
+
+**Client Components (`.cx`):**
+- Run entirely in browser
+- Import exposed functions - compiler generates HTTP fetch calls
+- Full interactivity with DOM access
+- Same function signature as server
 
 **Benefits:**
-✅ **Explicit** - `expose` shows API surface
-✅ **Type-safe** - Full checking across boundary
-✅ **No magic** - Direct function imports
-✅ **Secure** - Non-exposed functions can't be called
-✅ **Simple** - No separate API layer needed
-✅ **Enums travel** - Share enums between server and client
+- ✅ **Explicit** - `expose` shows API surface
+- ✅ **Type-safe** - Full checking across boundary
+- ✅ **No magic** - Direct function imports
+- ✅ **Secure** - Non-exposed functions can't be called
+- ✅ **Simple** - No separate API layer needed
+- ✅ **Enums travel** - Share enums between server and client
+- ✅ **SSR + Hydration** - Best of both worlds with `.sc` + `.cx`
 
 ---
 
 ## Components
 
+### Server Components (.sc)
+
+Server components render on the server and send HTML to the client. They can fetch data directly and embed client components for interactivity.
+
 ```typescript
+// page_layout.sc
+import { get_current_user } from "./auth_service.sx"
+import { NavBar } from "./nav_bar.cx"
+
+component PageLayout(children: node) {
+  user, err = await get_current_user()
+  
+  <html>
+    <head>
+      <title>My App</title>
+    </head>
+    <body>
+      // NavBar is a client component - hydrates for interactivity
+      <NavBar user={user} />
+      <main>
+        {children}
+      </main>
+    </body>
+  </html>
+}
+```
+
+```typescript
+// user_list.sc
+import { list_users, user_status } from "./user_service.sx"
+
+component UserList(limit: int = 10) {
+  users, err = await list_users(limit)
+  
+  if err {
+    return <p class="error">Failed to load users</p>
+  }
+  
+  if users.is_empty() {
+    return <p>No users found</p>
+  }
+  
+  <ul class="user-list">
+    {users.map((user) = (
+      <li key={user.id}>
+        <a href="/users/{user.id}">{user.name}</a>
+        <span>{user.email}</span>
+        <span class="status {user.status.value}">{user.status.value}</span>
+      </li>
+    ))}
+  </ul>
+}
+```
+
+### Client Components (.cx)
+
+Client components run in the browser and have full interactivity.
+
+```typescript
+// counter.cx
 component Counter(initial: int = 0) {
   count = initial
   
   increment() {
-    count.val += 1
+    count.value += 1
   }
   
-  <div>
-    <p>Count: {count}</p>
+  decrement() {
+    count.value -= 1
+  }
+  
+  <div class="counter">
+    <button @click={decrement}>-</button>
+    <span>{count}</span>
     <button @click={increment}>+</button>
   </div>
 }
@@ -1210,43 +1521,92 @@ component Counter(initial: int = 0) {
 
 ### Event Handling
 ```typescript
-component Form() {
+// form.cx
+component ContactForm() {
   name = ""
-  errors = []
+  email = ""
+  message = ""
+  errors: list<str> = []
+  submitting = false
   
   validate(): bool {
-    errors.val = []
+    errors.value = []
     
     if name.count() < 2 {
       errors.add("Name too short")
     }
     
-    return errors.empty()
+    if !email.includes("@") {
+      errors.add("Invalid email")
+    }
+    
+    if message.count() < 10 {
+      errors.add("Message too short")
+    }
+    
+    return errors.is_empty()
   }
   
-  submit(e) {
+  async submit(e) {
     e.prevent_default()
     
     if !validate() {
       return
     }
     
-    save_user({ name })
+    submitting.value = true
+    
+    result, err = await send_contact_message({ name, email, message })
+    if err {
+      errors.add("Failed to send: {err}")
+      submitting.value = false
+      return
+    }
+    
+    // Reset form
+    name.value = ""
+    email.value = ""
+    message.value = ""
+    submitting.value = false
   }
   
   <form @submit={submit}>
+    {!errors.is_empty() && (
+      <div class="errors">
+        {errors.map((e) = <p class="error">{e}</p>)}
+      </div>
+    )}
+    
     <input 
+      type="text"
+      placeholder="Name"
       value={name}
-      @input={(e) = name.val = e.target.value}
+      @input={(e) = name.value = e.target.value}
     />
-    <button>Submit</button>
-    {errors.map((e) = <p class="error">{e}</p>)}
+    
+    <input 
+      type="email"
+      placeholder="Email"
+      value={email}
+      @input={(e) = email.value = e.target.value}
+    />
+    
+    <textarea
+      placeholder="Message"
+      value={message}
+      @input={(e) = message.value = e.target.value}
+    />
+    
+    <button type="submit" disabled={submitting}>
+      {submitting ? "Sending..." : "Send"}
+    </button>
   </form>
 }
 ```
 
 ### Conditional Rendering
 ```typescript
+// user_profile.cx
 component UserProfile(user?: user) {
   <div>
     {user ? (
@@ -1259,50 +1619,47 @@ component UserProfile(user?: user) {
     )}
   </div>
 }
+```
 
-component UserList() {
-  users: list: user = []
-  loading = true
-  error?: str = null
+### Mixing Server and Client Components
+```typescript
+// dashboard.sc
+import { get_stats, get_recent_activity } from "./analytics_service.sx"
+import { LiveChart } from "./live_chart.cx"
+import { NotificationBell } from "./notification_bell.cx"
+
+component Dashboard() {
+  stats, _ = await get_stats()
+  activity, _ = await get_recent_activity(10)
   
-  async load_users() {
-    loading.val = true
-    error.val = null
+  <div class="dashboard">
+    <header>
+      <h1>Dashboard</h1>
+      // Client component for real-time notifications
+      <NotificationBell />
+    </header>
     
-    data, err = await list_users(20)
-    if err {
-      error.val = err
-      loading.val = false
-      return
-    }
+    // Static stats rendered on server
+    <div class="stats">
+      <div class="stat">
+        <span class="label">Users</span>
+        <span class="value">{stats.total_users}</span>
+      </div>
+      <div class="stat">
+        <span class="label">Revenue</span>
+        <span class="value">${stats.revenue}</span>
+      </div>
+    </div>
     
-    users.val = data
-    loading.val = false
-  }
-  
-  on_mount(() = {
-    load_users()
-  })
-  
-  <div>
-    {loading && <p>Loading users...</p>}
+    // Client component for interactive chart
+    <LiveChart initial_data={activity} />
     
-    {error && <p class="error">{error}</p>}
-    
-    {!loading && !error && (
-      <ul>
-        {users.map((u) = (
-          <li key={u.id}>
-            {u.name} - {u.email} - {match u.status {
-              user_status.pending = "Pending",
-              user_status.active = "Active",
-              user_status.suspended = "Suspended",
-              user_status.deleted = "Deleted"
-            }}
-          </li>
-        ))}
-      </ul>
-    )}
+    // Static list rendered on server
+    <ul class="activity">
+      {activity.map((item) = (
+        <li key={item.id}>{item.description}</li>
+      ))}
+    </ul>
   </div>
 }
 ```
@@ -1313,7 +1670,7 @@ component UserList() {
 
 ```typescript
 // Export types and functions (available within project)
-export get_user(id: int): result: user, error { }
+export get_user(id: int): result<user, error> { }
 export max_users = 1000
 export default UserService
 
@@ -1323,14 +1680,18 @@ export enum user_status {
   active: "active"
 }
 
-// Expose (API endpoint - callable from client)
-expose get_user(id: int): result: user, error { }
+// Expose (API endpoint - callable from .sc and .cx)
+expose get_user(id: int): result<user, error> { }
 
 // Import
 import { get_user, create_user } from "./user_service.sx"
 import * as UserService from "./user_service.sx"
 import type { user } from "./types.sx"
 import { user_status } from "./user_service.sx"
+
+// Import components
+import { UserCard } from "./user_card.sc"
+import { Counter } from "./counter.cx"
 ```
 
 ---
@@ -1338,7 +1699,7 @@ import { user_status } from "./user_service.sx"
 ## Async/Await
 
 ```typescript
-async fetch_user(id: int): result: user, error {
+async fetch_user(id: int): result<user, error> {
   response = await http.get("/users/{id}")
   return json.decode(response.body)
 }
@@ -1407,9 +1768,10 @@ regex = r"\d+\.\d+"
 
 ```
 async, await, bool, break, catch, component, continue,
-enum, err, export, expose, false, float, for, if, 
-import, in, int, list, map, match, null, return, 
-set, str, true, try, type, unknown, while
+date, datetime, enum, err, error, export, expose, false, 
+float, for, if, import, in, int, list, map, match, null, 
+on_mount, on_unmount, option, result, return, set, str, 
+time, true, try, tuple, type, undefined, unknown, while
 ```
 
 ---
@@ -1417,7 +1779,7 @@ set, str, true, try, type, unknown, while
 ## Complete Example
 
 ```typescript
-// user_service.sx (Server)
+// types.sx (Shared types)
 
 enum user_status {
   pending: "pending",
@@ -1448,9 +1810,15 @@ type create_user_request {
   email: str,
   age: int
 }
+```
 
-validate_email(email: str): result: bool, error {
-  if email.empty() {
+```typescript
+// user_service.sx (Server - Data Layer)
+
+import { user, user_status, user_role, create_user_request } from "./types.sx"
+
+validate_email(email: str): result<bool, error> {
+  if email.is_empty() {
     return err("Email required")
   }
   
@@ -1461,7 +1829,7 @@ validate_email(email: str): result: bool, error {
   return true
 }
 
-expose get_user(id: int): result: user, error {
+expose get_user(id: int): result<user, error> {
   user = Database.query("SELECT * FROM users WHERE id = ?", [id]).first()
   
   if user == null {
@@ -1471,7 +1839,7 @@ expose get_user(id: int): result: user, error {
   return user
 }
 
-expose create_user(request: create_user_request): result: user, error {
+expose create_user(request: create_user_request): result<user, error> {
   validate_email(request.email)
   
   if request.age < 18 {
@@ -1490,13 +1858,13 @@ expose create_user(request: create_user_request): result: user, error {
   return user
 }
 
-expose list_users(limit: int = 10, offset: int = 0): result: list: user, error {
+expose list_users(limit: int = 10, offset: int = 0): result<list<user>, error> {
   return Database.query(
     "SELECT * FROM users LIMIT {limit} OFFSET {offset}"
   ).all()
 }
 
-expose update_user_status(id: int, status: user_status): result: user, error {
+expose update_user_status(id: int, status: user_status): result<user, error> {
   existing = get_user(id)
   
   return Database.update("users", id, {
@@ -1504,7 +1872,7 @@ expose update_user_status(id: int, status: user_status): result: user, error {
   })
 }
 
-expose update_user_role(id: int, role: user_role): result: user, error {
+expose update_user_role(id: int, role: user_role): result<user, error> {
   existing = get_user(id)
   
   return Database.update("users", id, {
@@ -1522,149 +1890,246 @@ log_user_action(user_id: int, action: str) {
 ```
 
 ```typescript
-// external_api.sx (Server)
+// external_api.sx (Server - External API Integration)
 
-expose fetch_external_user(api_id: str): result: user, error {
+import { user, user_status, create_user_request } from "./types.sx"
+import { create_user } from "./user_service.sx"
+
+// Type for external API response (may differ from internal user type)
+type external_user_response {
+  name: str,
+  email?: str,
+  age: int | str    // External API is inconsistent
+}
+
+expose fetch_external_user(api_id: str): result<user, error> {
   response = await http.get("https://api.example.com/users/{api_id}")
-  data = json.parse(response.body)
   
-  if !data.is_map() {
-    return err("Invalid response format")
-  }
+  // Validate against type - clean and declarative
+  data = json.parse(response.body).validate(external_user_response)
   
-  if !data.has("name") || !data.get("name").is_str() {
-    return err("Missing or invalid name")
-  }
-  
-  age_value = data.get("age")
-  age = age_value.is_int() ? age_value : int(age_value)
-  
-  // Parse status from API
-  status_str = str(data.get("status"))
-  status = user_status.from(status_str) ?: user_status.pending
+  // Handle flexible age type
+  age = data.age.is_int() ? data.age : int(data.age)
   
   return create_user({
-    name: str(data.get("name")),
-    email: str(data.get("email")) ?: "",
+    name: data.name,
+    email: data.email ?: "",
     age: age
   })
 }
 ```
 
 ```typescript
-// user_profile.cx (Client)
+// user_card.sc (Server Component - SSR)
 
-import { 
-  get_user, 
-  update_user_status, 
-  update_user_role,
-  user_status,
-  user_role
-} from "./user_service.sx"
+import { user, user_status } from "./types.sx"
 
-component UserProfile(user_id: int) {
-  user?: user = null
-  loading = true
-  error?: str = null
-  editing = false
+component UserCard(user: user) {
+  <div class="user-card">
+    <h2>{user.name}</h2>
+    <p>{user.email}</p>
+    <p>Age: {user.age}</p>
+    <span class="badge {user.status.value}">
+      {match user.status {
+        user_status.pending = "⏳ Pending",
+        user_status.active = "✅ Active",
+        user_status.suspended = "🚫 Suspended",
+        user_status.deleted = "❌ Deleted"
+      }}
+    </span>
+  </div>
+}
+```
+
+```typescript
+// user_list.sc (Server Component - SSR)
+
+import { list_users } from "./user_service.sx"
+import { UserCard } from "./user_card.sc"
+
+component UserList(limit: int = 10) {
+  users, err = await list_users(limit)
   
-  async load_user() {
-    loading.val = true
-    error.val = null
-    
-    data, err = await get_user(user_id)
-    if err {
-      error.val = err
-      loading.val = false
-      return
-    }
-    
-    user.val = data
-    loading.val = false
+  if err {
+    return <p class="error">Failed to load users: {err}</p>
   }
   
+  if users.is_empty() {
+    return <p>No users found</p>
+  }
+  
+  <div class="user-list">
+    {users.map((user) = <UserCard key={user.id} user={user} />)}
+  </div>
+}
+```
+
+```typescript
+// status_editor.cx (Client Component - Interactive)
+
+import { update_user_status, update_user_role, user_status, user_role } from "./user_service.sx"
+
+component StatusEditor(user_id: int, initial_status: user_status, initial_role: user_role) {
+  status = initial_status
+  role = initial_role
+  loading = false
+  error?: str = null
+  
   async change_status(new_status: user_status) {
+    loading.value = true
+    error.value = null
+    
     updated, err = await update_user_status(user_id, new_status)
     if err {
-      error.val = err
+      error.value = err
+      loading.value = false
       return
     }
     
-    user.val = updated
+    status.value = updated.status
+    loading.value = false
   }
   
   async change_role(new_role: user_role) {
+    loading.value = true
+    error.value = null
+    
     updated, err = await update_user_role(user_id, new_role)
     if err {
-      error.val = err
+      error.value = err
+      loading.value = false
       return
     }
     
-    user.val = updated
+    role.value = updated.role
+    loading.value = false
   }
   
-  on_mount(() = {
-    load_user()
-  })
-  
-  <div>
-    {loading && <p>Loading...</p>}
-    
+  <div class="status-editor">
     {error && <p class="error">{error}</p>}
     
-    {!loading && !error && user && (
-      <div>
-        <h1>{user.name}</h1>
-        <p>{user.email}</p>
-        <p>Age: {user.age}</p>
-        
-        <div>
-          <strong>Status:</strong>
-          {match user.status {
-            user_status.pending = <span class="badge pending">⏳ Pending</span>,
-            user_status.active = <span class="badge active">✅ Active</span>,
-            user_status.suspended = <span class="badge suspended">🚫 Suspended</span>,
-            user_status.deleted = <span class="badge deleted">❌ Deleted</span>
-          }}
-        </div>
-        
-        <div>
-          <strong>Role:</strong>
-          {match user.role {
-            user_role.admin = <span class="badge admin">👑 Admin</span>,
-            user_role.moderator = <span class="badge mod">🛡️ Moderator</span>,
-            user_role.user = <span class="badge user">👤 User</span>,
-            user_role.guest = <span class="badge guest">🔓 Guest</span>
-          }}
-        </div>
-        
-        <div class="actions">
-          {user.status == user_status.active && (
-            <button @click={() = change_status(user_status.suspended)}>
-              Suspend User
-            </button>
-          )}
-          
-          {user.status == user_status.suspended && (
-            <button @click={() = change_status(user_status.active)}>
-              Activate User
-            </button>
-          )}
-          
-          <select @change={(e) = change_role(user_role.from(e.target.value))}>
-            {user_role.values().map((role) = (
-              <option 
-                value={role.value} 
-                selected={user.role == role}
-              >
-                {role.value}
-              </option>
-            ))}
-          </select>
-        </div>
+    <div class="field">
+      <label>Status:</label>
+      <div class="buttons">
+        {status == user_status.active && (
+          <button @click={() = change_status(user_status.suspended)} disabled={loading}>
+            Suspend
+          </button>
+        )}
+        {status == user_status.suspended && (
+          <button @click={() = change_status(user_status.active)} disabled={loading}>
+            Activate
+          </button>
+        )}
+        {status == user_status.pending && (
+          <button @click={() = change_status(user_status.active)} disabled={loading}>
+            Approve
+          </button>
+        )}
       </div>
-    )}
+    </div>
+    
+    <div class="field">
+      <label>Role:</label>
+      <select 
+        @change={(e) = change_role(user_role.from(e.target.value))}
+        disabled={loading}
+      >
+        {user_role.values().map((r) = (
+          <option value={r.value} selected={role == r}>
+            {r.value}
+          </option>
+        ))}
+      </select>
+    </div>
   </div>
+}
+```
+
+```typescript
+// profile_page.sc (Server Component with Client Interactivity)
+
+import { get_user } from "./user_service.sx"
+import { user_status, user_role } from "./types.sx"
+import { StatusEditor } from "./status_editor.cx"
+
+component ProfilePage(user_id: int) {
+  user, err = await get_user(user_id)
+  
+  if err {
+    return (
+      <div class="error-page">
+        <h1>User Not Found</h1>
+        <p>{err}</p>
+        <a href="/users">Back to Users</a>
+      </div>
+    )
+  }
+  
+  <div class="profile-page">
+    <header>
+      <h1>{user.name}</h1>
+      <p class="email">{user.email}</p>
+    </header>
+    
+    <section class="details">
+      <h2>Details</h2>
+      <dl>
+        <dt>Age</dt>
+        <dd>{user.age}</dd>
+        
+        <dt>Member Since</dt>
+        <dd>{user.created_at.format("MMMM D, YYYY")}</dd>
+        
+        <dt>Current Status</dt>
+        <dd>{user.status.value}</dd>
+        
+        <dt>Current Role</dt>
+        <dd>{user.role.value}</dd>
+      </dl>
+    </section>
+    
+    <section class="admin">
+      <h2>Admin Controls</h2>
+      // Client component for interactivity
+      <StatusEditor 
+        user_id={user_id} 
+        initial_status={user.status}
+        initial_role={user.role}
+      />
+    </section>
+  </div>
+}
+```
+
+```typescript
+// app.sc (Root Layout)
+
+import { UserList } from "./user_list.sc"
+import { ProfilePage } from "./profile_page.sc"
+
+component App(route: str, params: map<str, str>) {
+  <html>
+    <head>
+      <title>User Management</title>
+      <link rel="stylesheet" href="/styles.css" />
+    </head>
+    <body>
+      <nav>
+        <a href="/">Home</a>
+        <a href="/users">Users</a>
+      </nav>
+      
+      <main>
+        {match route {
+          "/" = <h1>Welcome</h1>,
+          "/users" = <UserList limit={20} />,
+          "/users/:id" = <ProfilePage user_id={int(params.get("id"))} />,
+          _ = <h1>404 - Not Found</h1>
+        }}
+      </main>
+    </body>
+  </html>
 }
 ```
 
@@ -1675,22 +2140,37 @@ component UserProfile(user_id: int) {
 ```
 project/
 ├── src/
-│   ├── server/
+│   ├── server/                  # Server-only code (.sx)
 │   │   ├── user_service.sx
 │   │   ├── auth_service.sx
-│   │   ├── types.sx
+│   │   ├── external_api.sx
 │   │   └── database.sx
-│   ├── client/
-│   │   ├── components/
-│   │   │   ├── UserCard.cx
-│   │   │   └── LoginForm.cx
-│   │   └── utils/
-│   │       └── api.cx
+│   ├── components/
+│   │   ├── server/              # Server components (.sc)
+│   │   │   ├── UserCard.sc
+│   │   │   ├── UserList.sc
+│   │   │   ├── ProfilePage.sc
+│   │   │   └── Layout.sc
+│   │   └── client/              # Client components (.cx)
+│   │       ├── StatusEditor.cx
+│   │       ├── Counter.cx
+│   │       ├── LoginForm.cx
+│   │       └── LiveChart.cx
+│   ├── pages/                   # Page components (typically .sc)
+│   │   ├── home.sc
+│   │   ├── users.sc
+│   │   ├── profile.sc
+│   │   └── settings.cx          # Client-only page if needed
 │   └── shared/
-│       └── enums.sx
+│       ├── types.sx             # Shared types
+│       └── enums.sx             # Shared enums
 ├── tests/
 │   ├── user_service_test.sx
-│   └── components_test.cx
+│   ├── user_card_test.sc
+│   └── status_editor_test.cx
+├── public/
+│   ├── styles.css
+│   └── images/
 └── rivo.config.sx
 ```
 
@@ -1699,7 +2179,7 @@ project/
 ## Best Practices
 
 ### Use Guard Clauses
-Check error conditions early and return. Happy path stays at the main level.
+Check error conditions early and return. Happy path stays at the main level. No `else` needed.
 
 ### Tuple Destructuring for Error Handling
 Use `data, err = function()` pattern for explicit error handling in client code.
@@ -1707,11 +2187,11 @@ Use `data, err = function()` pattern for explicit error handling in client code.
 ### Automatic Error Propagation
 In `result`-returning functions, errors propagate automatically - no manual checking needed.
 
+### Use Schema Validation
+Validate JSON and unknown data against types using `.validate(type)` for clean, declarative parsing.
+
 ### Use Strict Equality
 Rivo only has `==` and it's always strict (checks type and value). No need to remember `===`.
-
-### Type Check Unknown Data
-When working with JSON or dynamic data, always use `.is_*()` methods before accessing.
 
 ### Cast Types Explicitly
 Use `int()`, `str()`, `float()`, `bool()` for explicit type conversion. No implicit coercion.
@@ -1720,57 +2200,4 @@ Use `int()`, `str()`, `float()`, `bool()` for explicit type conversion. No impli
 Define enums with explicit backing values for database storage and API serialization.
 
 ### Expose Only What's Needed
-Use `expose` sparingly - only mark functions that should be callable from the client.
-
-### Share Enums Between Server and Client
-Import enums in client code to ensure type safety across the boundary.
-
-### Prefer Match for Multi-Branch
-When you have more than two conditions, use `match` instead of nested ternaries.
-
-### Choose ?? vs ?: Carefully
-Use `??` when you only want to replace null/undefined. Use `?:` when you want to replace any falsy value (including 0, false, "").
-
-### Use Spaceship for Sorting
-Three-way comparison operator makes sorting cleaner and more efficient.
-
-### Use Unified Collection API
-Use `.count()`, `.has()`, `.add()`, etc. consistently across all collection types.
-
-### Leverage Type Inference
-Let the compiler infer collection types from literals when possible.
-
-### Embrace Locality
-Keep related logic together in cohesive units rather than scattering across files.
-
-### Compose Naturally
-Build systems from small, modular pieces that combine cleanly.
-
-### Be Explicit
-Make mutation and error handling visible and intentional.
-
-### Stay Pragmatic
-Choose simplicity over architectural purity when appropriate.
-
----
-
-## Roadmap
-
-- Component lifecycle hooks (on_mount, on_unmount, effects)
-- Decorators/attributes
-- Generics and constraints
-- Testing framework
-- Package manager
-- Standard library
-- Build tooling
-- WebAssembly target
-
----
-
-**Language:** Rivo  
-**Tagline:** Full-stack in flow  
-**Version:** 0.1  
-**Status:** Draft  
-**Last Updated:** 2026-01-22
-
-"Like a river, code should flow naturally between its banks."
+Use `
